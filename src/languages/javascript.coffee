@@ -1,8 +1,9 @@
 _ = window?._ ? self?._ ? global?._ ? require 'lodash'  # rely on lodash existing, since it busts CodeCombat to browserify it--TODO
 
-jshint = require('jshint').JSHINT
+jshintHolder = {}
 esprima = require 'esprima'  # getting our Esprima Harmony
 acorn_loose = require 'acorn/acorn_loose'  # for if Esprima dies. Note it can't do ES6.
+escodegen = require 'escodegen'
 
 Language = require './language'
 traversal = require '../traversal'
@@ -11,6 +12,12 @@ module.exports = class JavaScript extends Language
   name: 'JavaScript'
   id: 'javascript'
   parserID: 'esprima'
+  thisValue: 'this'
+  thisValueAccess: 'this.'
+
+  constructor: ->
+    super arguments...
+    jshintHolder.jshint ?= (self?.aetherJSHint ? require('jshint')).JSHINT
 
   # Return true if we can very quickly identify a syntax error.
   obviouslyCannotTranspile: (rawCode) ->
@@ -40,14 +47,35 @@ module.exports = class JavaScript extends Language
       console.log "Couldn't even loosely parse; are you sure #{a} and #{b} are #{@name}?"
       return true
     # acorn_loose annoyingly puts start/end in every node; we'll remove before comparing
-    removeLocations = (node) -> node.start = node.end = null
+    removeLocations = (node) -> node.start = node.end = null if node
     traversal.walkAST aAST, removeLocations
     traversal.walkAST bAST, removeLocations
     return not _.isEqual(aAST, bAST)
 
+  # Replace instances of 'loop {}' with 'while (true) {}'
+  # Assuming 'loop' is on a single line, only preceded by whitespace
+  replaceLoops: (rawCode) ->
+    return [rawCode, []] if rawCode.indexOf('loop') is -1
+    convertedCode = ""
+    replacedLoops = []
+    rangeIndex = 0
+    lines = rawCode.split '\n'
+    for line, lineNumber in lines
+      if line.replace(/^\s+/g, "").indexOf('loop') is 0
+        start = line.indexOf 'loop'
+        a = line.split("")
+        a[start..start + 3] = 'while (true)'.split ""
+        line = a.join("")
+        replacedLoops.push rangeIndex + start
+      convertedCode += line
+      convertedCode += '\n' unless lineNumber is lines.length - 1
+      rangeIndex += line.length + 1 # + newline
+    [convertedCode, replacedLoops]
+
   # Return an array of problems detected during linting.
   lint: (rawCode, aether) ->
     lintProblems = []
+    return lintProblems unless jshintHolder.jshint
     wrappedCode = @wrap rawCode, aether
 
     # Run it through JSHint first, because that doesn't rely on Esprima
@@ -60,12 +88,49 @@ module.exports = class JavaScript extends Language
     #  console.log 'gotta ignore', problem, '-' + problemID.replace('jshint_', '')
     #  jshintOptions['-' + problemID.replace('jshint_', '')] = true
     try
-      jshintSuccess = jshint(wrappedCode, jshintOptions, jshintGlobals)
+      jshintSuccess = jshintHolder.jshint(wrappedCode, jshintOptions, jshintGlobals)
     catch e
       console.warn "JSHint died with error", e  #, "on code\n", wrappedCode
-    for error in jshint.errors
-      lintProblems.push aether.createUserCodeProblem type: 'transpile', reporter: 'jshint', error: error, code: wrappedCode, codePrefix: aether.wrappedCodePrefix
+    for error in jshintHolder.jshint.errors
+      lintProblems.push aether.createUserCodeProblem type: 'transpile', reporter: 'jshint', error: error, code: wrappedCode, codePrefix: @wrappedCodePrefix
 
+    # Check for stray semi-colon on 1st line of if statement
+    # E.g. "if (parsely);"
+    # TODO: Does not handle stray semi-colons on following lines: "if (parsely)\n;"
+    if _.isEmpty lintProblems
+      lines = rawCode.split /\r\n|[\n\r\u2028\u2029]/g
+      offset = 0
+      for line, row in lines
+        if /^\s*if /.test(line)
+          # Have an if statement
+          if (firstParen = line.indexOf('(')) >= 0
+            parenCount = 1
+            for c, i in line[firstParen + 1..line.length]
+              parenCount++ if c is '('
+              parenCount-- if c is ')'
+              break if parenCount is 0
+            # parenCount should be zero at the end of the if (test)
+            i += firstParen + 1 + 1
+            if parenCount is 0 and /^[ \t]*;/.test(line[i..line.length])
+              # And it's followed immediately by a semi-colon
+              firstSemiColon = line.indexOf(';')
+              lintProblems.push
+                type: 'transpile'
+                reporter: 'aether'
+                level: 'warning'
+                message: "Don't put a ';' after an if statement."
+                range: [
+                    ofs: offset + firstSemiColon
+                    row: row
+                    col: firstSemiColon
+                  ,
+                    ofs: offset + firstSemiColon + 1
+                    row: row
+                    col: firstSemiColon + 1
+                ]
+              break
+        # TODO: this may be off by 1*row if linebreak was \r\n
+        offset += line.length + 1
     lintProblems
 
   # Return a beautified representation of the code (cleaning up indentation, etc.)
@@ -83,10 +148,7 @@ module.exports = class JavaScript extends Language
   wrap: (rawCode, aether) ->
     @wrappedCodePrefix ?="""
     function #{aether.options.functionName or 'foo'}(#{aether.options.functionParameters.join(', ')}) {
-    \"use strict\";
     """
-    # Should add \n after? (Not `"use strict";this.moveXY(30, 26);` on one line.)
-    # TODO: Try it and make sure our line counts are fine.
     @wrappedCodeSuffix ?= "\n}"
     @wrappedCodePrefix + rawCode + @wrappedCodeSuffix
 
@@ -101,6 +163,7 @@ module.exports = class JavaScript extends Language
 
   # Using a third-party parser, produce an AST in the standardized Mozilla format.
   parse: (code, aether) ->
+    # loc: https://github.com/codecombat/aether/issues/71
     ast = esprima.parse code, {range: true, loc: true}
 
   # Optional: if parseDammit() is implemented, then if parse() throws an error, we'll try again using parseDammit().

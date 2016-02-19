@@ -4,7 +4,6 @@ _ = window?._ ? self?._ ? global?._ ? require 'lodash'  # rely on lodash existin
 
 esprima = require 'esprima'  # getting our Esprima Harmony
 acorn_loose = require 'acorn/acorn_loose'  # for if Esprima dies. Note it can't do ES6.
-csredux = require 'coffee-script-redux'
 
 # TODO: see about consolidating
 module.exports.walkAST = walkAST = (node, fn) ->
@@ -15,6 +14,16 @@ module.exports.walkAST = walkAST = (node, fn) ->
     else if _.isString child?.type
       walkAST child, fn
     fn child
+
+module.exports.walkASTCorrect = walkASTCorrect = (node, fn) ->
+  for key, child of node
+    if _.isArray child
+      for grandchild in child
+        if _.isString grandchild?.type
+          walkASTCorrect grandchild, fn
+    else if _.isString child?.type
+      walkASTCorrect child, fn
+  fn node
 
 module.exports.morphAST = morphAST = (source, transforms, parseFn, aether) ->
   chunks = source.split ''

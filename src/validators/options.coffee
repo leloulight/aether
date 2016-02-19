@@ -9,25 +9,25 @@ module.exports = (options) ->
         required: false
       globals:
         type: 'array'
-        required: false
       functionName:
-        required: false
+        type: 'string'
       functionParameters:
-        required: false
+        type: ['array', 'undefined']
       yieldAutomatically:
         type: 'boolean'
-        required: false
       yieldConditionally:
         type: 'boolean'
-        required: false
       executionCosts:
-        required: false
+        type: 'object'
+      executionLimit:
+        type: 'integer'
+        minimum: 0
+        description: 'If given and non-zero, user code will throw execution exceeded errors after using too many statements.'
       language:
         type: 'string'
         description: "Input language"
         minLength:1
-        'enum': ['javascript', 'coffeescript', 'clojure', 'lua', 'python', 'io']
-        required: false
+        'enum': ['javascript', 'coffeescript', 'python', 'clojure', 'lua', 'io', 'java']
       languageVersion:
         oneOf: [
           type: 'string'
@@ -39,31 +39,25 @@ module.exports = (options) ->
           description: "Input language version"
         ]
       problems:
-        required: false
+        type: ['object', 'undefined']
+      problemContext:
+        type: ['object', 'null', 'undefined']
       includeFlow:
-        oneOf: [
-          type: 'boolean'
-          default: true
-          description: "If true, will record everything."
-        ,
-          type: 'object'
-          description: "Limitations on what to record."
-          properties:
-            callIndex:
-              type: 'integer'
-              description: "If set, record flow only for the given call, not every call."
-            statementIndex:
-              type: 'integer'
-              description: "If set, record flow only for the given statement within the given call."
-            timelessVariables:
-              type: 'array'
-              description: "Record flow for these variables regardless of callIndex and statementIndex."
-              items:
-                type: 'string'
-        ]
+        type: 'boolean'
+        default: true
+        description: "Whether to record control flow and variable values as user code executes."
       noSerializationInFlow:
         type: 'boolean'
         default: false
+        description: "Whether to skip serializing variable values when recording variables in flow."
+      noVariablesInFlow:
+        type: 'boolean'
+        default: false
+        description: "Whether to skip capturing variable values at all when instrumenting flow."
+      skipDuplicateUserInfoInFlow:
+        type: 'boolean'
+        default: false
+        description: "Whether to skip recording calls with the same userInfo as the previous call when instrumenting flow."
       includeMetrics:
         type: 'boolean'
         default: true
@@ -74,3 +68,15 @@ module.exports = (options) ->
         type: 'boolean'
         default: false
         description: "Whether to clone/restore values coming in and out of user code to limit them to apiProperties."
+      simpleLoops:
+        type: 'boolean'
+        default: false
+        description: "Whether simple loops will be supported, per language.  E.g. 'loop()' will be transpiled as 'while(true)'."
+      protectBuiltins:
+        type: 'boolean'
+        default: true
+        description: 'Whether builtins will be protected and restored for enhanced security.'
+      whileTrueAutoYield:
+        type: 'boolean'
+        default: false
+        description: "Make while True loops automatically yield if no other yields"

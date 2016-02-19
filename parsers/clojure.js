@@ -1,0 +1,1 @@
+window.aetherCloser = require('closer');

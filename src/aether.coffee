@@ -1,3 +1,7 @@
+self = window if window? and not self?
+self = global if global? and not self?
+self.self ?= self
+
 _ = window?._ ? self?._ ? global?._ ? require 'lodash'  # rely on lodash existing, since it busts CodeCombat to browserify it--TODO
 traceur = window?.traceur ? self?.traceur ? global?.traceur ? require 'traceur'  # rely on traceur existing, since it busts CodeCombat to browserify it--TODO
 
@@ -19,6 +23,8 @@ languages = require './languages/languages'
 module.exports = class Aether
   @execution: execution
   @addGlobal: protectBuiltins.addGlobal  # Use before instantiating Aether instances
+  @replaceBuiltin: protectBuiltins.replaceBuiltin
+  @globals: protectBuiltins.addedGlobals
 
   # Current call depth
   depth: 0
@@ -33,11 +39,15 @@ module.exports = class Aether
     @originalOptions = _.cloneDeep options  # TODO: slow
 
     # Merge the given options with the defaults.
-    defaultsCopy = _.extend({}, defaults)
+    defaultsCopy = _.cloneDeep defaults
     @options = _.merge defaultsCopy, options
 
     @setLanguage @options.language, @options.languageVersion
     @allGlobals = @options.globals.concat protectBuiltins.builtinNames, Object.keys @language.runtimeGlobals  # After setLanguage, which can add globals.
+
+    ## For mapping API clones and values to each other
+    @protectAPIClonesToValues = {}
+    @protectAPIValuesToClones = {}
 
   # Language can be changed after construction. (It will reset Aether's state.)
   setLanguage: (language, languageVersion) ->
@@ -63,7 +73,7 @@ module.exports = class Aether
 
   # Convert to JSON so we can pass it across web workers and HTTP requests and store it in databases and such.
   serialize: ->
-    _.pick @, ['originalOptions', 'raw', 'pure', 'problems', 'flow', 'metrics', 'style']
+    _.pick @, ['originalOptions', 'raw', 'pure', 'problems', 'flow', 'metrics', 'style', 'ast']
 
   # Convert a serialized Aether instance back from JSON.
   @deserialize: (serialized) ->
@@ -92,8 +102,8 @@ module.exports = class Aether
 
   # Determine whether two strings of code produce different lint problems.
   hasChangedLintProblems: (a, b) ->
-    aLintProblems = [p.id, p.message, p.hint] for p in @getAllProblems @lint a
-    bLintProblems = [p.id, p.message, p.hint] for p in @getAllProblems @lint b
+    aLintProblems = ([p.id, p.message, p.hint] for p in @getAllProblems @lint a)
+    bLintProblems = ([p.id, p.message, p.hint] for p in @getAllProblems @lint b)
     return not _.isEqual aLintProblems, bLintProblems
 
   # Return a beautified representation of the code (cleaning up indentation, etc.)
@@ -103,8 +113,15 @@ module.exports = class Aether
   # Transpile it. Even if it can't transpile, it will give syntax errors and warnings and such. Clears any old state.
   transpile: (@raw) ->
     @reset()
-    @problems = @lint @raw
-    @pure = @purifyCode @raw
+    rawCode = @raw
+    if @options.simpleLoops
+      rawCode = _.cloneDeep @raw
+      [rawCode, @replacedLoops, loopProblems] = @language.replaceLoops rawCode
+    @problems = @lint rawCode
+    loopProblems ?= []
+    if loopProblems.length > 0
+      @problems.warnings.push loopProblems...
+    @pure = @purifyCode rawCode
     @pure
 
   # Perform some fast static analysis (without transpiling) and find any lint problems.
@@ -116,7 +133,9 @@ module.exports = class Aether
   # Return a ready-to-execute, instrumented, sandboxed function from the purified code.
   createFunction: ->
     fn = protectBuiltins.createSandboxedFunction @options.functionName or 'foo', @pure, @
-    protectBuiltins.wrapWithSandbox @, fn
+    if @options.protectBuiltins
+      fn = protectBuiltins.wrapWithSandbox @, fn
+    fn
 
   # Like createFunction, but binds method to thisValue.
   createMethod: (thisValue) ->
@@ -125,8 +144,10 @@ module.exports = class Aether
   # If you want to sandbox a generator each time it's called, then call result of createFunction and hand to this.
   sandboxGenerator: (fn) ->
     oldNext = fn.next
-    fn.next = protectBuiltins.wrapWithSandbox @, ->
+    fn.next = ->
       oldNext.apply fn, arguments
+    if @options.protectBuiltins
+      fn.next = protectBuiltins.wrapWithSandbox @, fn.next
     fn
 
   # Convenience wrapper for running the compiled function with default error handling
@@ -142,9 +163,13 @@ module.exports = class Aether
     catch error
       problem = @createUserCodeProblem error: error, code: @raw, type: 'runtime', reporter: 'aether'
       @addProblem problem
+      return
 
   # Create a standard Aether problem object out of some sort of transpile or runtime problem.
   createUserCodeProblem: problems.createUserCodeProblem
+
+  updateProblemContext: (problemContext) ->
+    @options.problemContext = problemContext
 
   # Add problem to the proper level's array within the given problems object (or @problems).
   addProblem: (problem, problems=null) ->
@@ -166,20 +191,21 @@ module.exports = class Aether
     varNames[parameter] = true for parameter in @options.functionParameters
     preNormalizationTransforms = [
       transforms.makeGatherNodeRanges originalNodeRanges, wrappedCode, @language.wrappedCodePrefix
-      transforms.makeCheckThisKeywords @allGlobals, varNames
-      transforms.checkIncompleteMembers
+      transforms.makeCheckThisKeywords @allGlobals, varNames, @language, @options.problemContext
+      transforms.makeCheckIncompleteMembers @language, @options.problemContext
     ]
 
     try
       [transformedCode, transformedAST] = @transform wrappedCode, preNormalizationTransforms, @language.parse, true
+      @ast = transformedAST
     catch error
-      # TODO: test if using @language.wrappedCodePrefix is better here than ''
-      problemOptions = error: error, code: wrappedCode, codePrefix: '', reporter: @language.parserID, kind: error.index or error.id, type: 'transpile'
+      problemOptions = error: error, code: wrappedCode, codePrefix: @language.wrappedCodePrefix, reporter: @language.parserID, kind: error.index or error.id, type: 'transpile'
       @addProblem @createUserCodeProblem problemOptions
       return '' unless @language.parseDammit
       originalNodeRanges.splice()  # Reset any ranges we did find; we'll try again.
       try
         [transformedCode, transformedAST] = @transform wrappedCode, preNormalizationTransforms, @language.parseDammit, true
+        @ast = transformedAST
       catch error
         problemOptions.kind = error.index or error.id
         problemOptions.reporter = 'acorn_loose' if @language.id is 'javascript'
@@ -189,29 +215,57 @@ module.exports = class Aether
     # Now we've shed all the trappings of the original language behind; it's just JavaScript from here on.
 
     # TODO: need to insert 'use strict' after normalization, since otherwise you get tmp2 = 'use strict'
-    normalizedAST = normalizer.normalize transformedAST, {}
+    try
+      normalizedAST = normalizer.normalize transformedAST, {reference_errors: true}
+    catch error
+      console.log "JS_WALA couldn't handle", transformedAST, "\ngave error:", error.toString()
+      problemOptions = error: error, message: 'Syntax error during code normalization.', kind: 'NormalizationError', code: '', codePrefix: '', reporter: 'aether', type: 'transpile', hint: "Possibly a bug with advanced #{@language.name} feature parsing."
+      @addProblem @createUserCodeProblem problemOptions
+      return ''
     normalizedNodeIndex = []
     traversal.walkAST normalizedAST, (node) ->
       return unless pos = node?.attr?.pos
       node.loc = {start: {line: 1, column: normalizedNodeIndex.length}, end: {line: 1, column: normalizedNodeIndex.length + 1}}
       normalizedNodeIndex.push node
 
-    normalized = escodegen.generate normalizedAST, {sourceMap: @options.functionName or 'foo', sourceMapWithCode: true}
-    normalizedCode = normalized.code
-    normalizedSourceMap = normalized.map
+    try
+      normalized = escodegen.generate normalizedAST, {sourceMap: @options.functionName or 'foo', sourceMapWithCode: true}
+      normalizedCode = normalized.code
+      normalizedSourceMap = normalized.map
+    catch error
+      console.warn "escodegen couldn't handle", normalizedAST, "\ngave error:", error.toString()
+      try
+        # Maybe we can get it to work without source maps, if it errored during source mapping. Ranges (and thus other things) won't work, though.
+        normalizedCode = escodegen.generate normalizedAST, {}
+        normalizedSourceMap = null
+      catch error2
+        # Well, it was worth a try to do it without source maps.
+        problemOptions = error: error, message: 'Syntax error during code generation.', kind: 'CodeGenerationError', code: '', codePrefix: '', reporter: 'aether', type: 'transpile', hint: "Possibly a bug with advanced #{@language.name} feature parsing."
+        @addProblem @createUserCodeProblem problemOptions
+        return ''
 
     postNormalizationTransforms = []
-    postNormalizationTransforms.unshift transforms.validateReturns if @options.thisValue?.validateReturn  # TODO: parameter/return validation should be part of Aether, not some half-external function call
-    postNormalizationTransforms.unshift transforms.yieldConditionally if @options.yieldConditionally
-    postNormalizationTransforms.unshift transforms.yieldAutomatically if @options.yieldAutomatically
+    if @options.yieldConditionally and @options.simpleLoops
+      postNormalizationTransforms.unshift transforms.makeSimpleLoopsYieldAutomatically @replacedLoops, @language.wrappedCodePrefix
+    if @options.yieldConditionally and @options.whileTrueAutoYield
+      postNormalizationTransforms.unshift transforms.makeWhileTrueYieldAutomatically @replacedLoops, @language.wrappedCodePrefix
+    if @options.yieldConditionally
+      postNormalizationTransforms.unshift transforms.makeYieldConditionally @options.simpleLoops, @options.whileTrueAutoYield
+    if @options.yieldConditionally and (@options.simpleLoops or @options.whileTrueAutoYield)
+      postNormalizationTransforms.unshift transforms.makeIndexWhileLoops()
+    postNormalizationTransforms.unshift transforms.makeYieldAutomatically() if @options.yieldAutomatically
     if @options.includeFlow
-      postNormalizationTransforms.unshift transforms.makeInstrumentStatements varNames
-    else if @options.includeMetrics
-      postNormalizationTransforms.unshift transforms.makeInstrumentStatements()
+      varNamesToRecord = if @options.noVariablesInFlow then null else varNames
+      postNormalizationTransforms.unshift transforms.makeInstrumentStatements @language, varNamesToRecord, true
+    else if @options.includeMetrics or @options.executionLimit
+      postNormalizationTransforms.unshift transforms.makeInstrumentStatements @language
     postNormalizationTransforms.unshift transforms.makeInstrumentCalls() if @options.includeMetrics or @options.includeFlow
-    postNormalizationTransforms.unshift transforms.makeFindOriginalNodes originalNodeRanges, @language.wrappedCodePrefix, normalizedSourceMap, normalizedNodeIndex
-    postNormalizationTransforms.unshift transforms.makeProtectAPI @options.functionParameters if @options.protectAPI
+    if normalizedSourceMap
+      postNormalizationTransforms.unshift transforms.makeFindOriginalNodes originalNodeRanges, @language.wrappedCodePrefix, normalizedSourceMap, normalizedNodeIndex
+    postNormalizationTransforms.unshift transforms.convertToNativeTypes
+    postNormalizationTransforms.unshift transforms.protectAPI if @options.protectAPI
     postNormalizationTransforms.unshift transforms.interceptThis
+    postNormalizationTransforms.unshift transforms.interceptEval
     try
       instrumentedCode = @transform normalizedCode, postNormalizationTransforms, @languageJS.parse
     catch error
@@ -219,7 +273,13 @@ module.exports = class Aether
       @addProblem @createUserCodeProblem problemOptions
       instrumentedCode = @transform normalizedCode, postNormalizationTransforms, @languageJS.parseDammit
     if @options.yieldConditionally or @options.yieldAutomatically
-      purifiedCode = @traceurify instrumentedCode
+      try
+        purifiedCode = @traceurify instrumentedCode
+      catch error
+        console.log "Traceur couldn't handle", instrumentedCode, "\ngave error:", error.toString()
+        problemOptions = error: error, code: instrumentedCode, codePrefix: '', reporter: 'aether', kind: 'TraceurError', type: 'transpile', message: 'Syntax error during code transmogrification.', hint: 'Possibly a bug with break/continue parsing.'
+        @addProblem @createUserCodeProblem problemOptions
+        return ''
     else
       purifiedCode = instrumentedCode
     interceptThis = 'var __interceptThis=(function(){var G=this;return function($this,sandbox){if($this==G){return sandbox;}return $this;};})();\n'
@@ -241,11 +301,14 @@ module.exports = class Aether
     [transformedCode, transformedAST]
 
   traceurify: (code) ->
-    url = "randotron_" + Math.random()
+    # Latest Traceur version that works with this hacky API is 0.0.25.
+    # Versions 0.0.27 - 0.0.34 complained about System.baseURL being an empty string despite my best attempts to provide it.
+    # Versions 0.0.35 - 0.0.41 complained that the EvalCodeUnit's metadata was undefined and so it couldn't find "tree".
+    url = "http://codecombat.com/randotron_" + Math.random()
     reporter = new traceur.util.ErrorReporter()
     loaderHooks = new traceur.runtime.InterceptOutputLoaderHooks reporter, url
-    loader = new traceur.System.internalLoader_.constructor loaderHooks  # Some day traceur's API will stabilize.
-    loader.script code, url
+    loader = new traceur.System.internalLoader_.constructor loaderHooks, url  # Some day traceur's API will stabilize.
+    loader.script code, url, url, url
     # Could also do the following, but that wraps in a module
     #loader = new traceur.runtime.Loader loaderHooks
     #loader.module code, url
@@ -261,6 +324,26 @@ module.exports = class Aether
     lines = source.split /\r?\n/
     indent = if lines.length then lines[0].length - lines[0].replace(/^ +/, '').length else 0
     (line.slice indent for line in lines).join '\n'
+
+  convertToNativeType: (obj) ->
+    # Convert obj to current language's equivalent type if necessary
+    # E.g. if language is Python, JavaScript Array is converted to a Python list
+    @language.convertToNativeType(obj)
+
+  getStatementCount: ->
+    count = 0
+    root = @ast.body[0].body # We assume the 'code' is one function hanging inside the program.
+    #console.log(JSON.stringify root, null, '  ')
+    traversal.walkASTCorrect root, (node) ->
+      return if not node.type?
+      return if node.userCode == false
+      if node.type in [
+        'ExpressionStatement', 'ReturnStatement', 'ForStatement', 'ForInStatement',
+        'WhileStatement', 'DoWhileStatement', 'FunctionDeclaration', 'VariableDeclaration',
+        'IfStatement', 'SwitchStatement', 'ThrowStatement', 'ContinueStatement', 'BreakStatement'
+      ]
+        ++count
+    return count
 
   # Runtime modules
 

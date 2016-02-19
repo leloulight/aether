@@ -54,10 +54,13 @@ showProblems = (aether) ->
           type: "array"
           maxItems: aether.problems.infos.length
 
-  treema = TreemaNode.make(el, treemaOptions)
-  treema.build()
-  $("#aether-problems").empty().append el
-  treema.open 2
+  try
+    treema = TreemaNode.make(el, treemaOptions)
+    treema.build()
+    $("#aether-problems").empty().append el
+    treema.open 2
+  catch err
+    console.error "Couldn't make problems Treema:", err
   editor = editors[0]
   session = editor.getSession()
   annotations = []
@@ -112,10 +115,13 @@ showFlow = (aether) ->
       properties:
         states:
           type: "array"
-  treema = TreemaNode.make(el, treemaOptions)
-  treema.build()
-  $("#aether-flow").append el
-  treema.open 3
+  try
+    treema = TreemaNode.make(el, treemaOptions)
+    treema.build()
+    $("#aether-flow").append el
+    treema.open 3
+  catch err
+    console.error "Couldn't make flow Treema:", err
 
 showMetrics = (aether) ->
   $("#aether-metrics").empty()
@@ -126,15 +132,19 @@ showMetrics = (aether) ->
     data: aether.metrics
     schema:
       type: "object"
-  treema = TreemaNode.make(el, treemaOptions)
-  treema.build()
-  $("#aether-metrics").append el
-  treema.open 1
+  try
+    treema = TreemaNode.make(el, treemaOptions)
+    treema.build()
+    $("#aether-metrics").append el
+    treema.open 1
+  catch err
+    console.error "Couldn't make metrics Treema:", err
 
 demoShowOutput = (aether) ->
   showProblems aether
   editors[2].setValue aether.pure
   editors[2].clearSelection()
+  window.lastAether = aether
   showMetrics aether
   showFlow aether
 
@@ -144,7 +154,7 @@ clearOutput = ->
   $("#aether-flows").empty()
   $("#aether-problems").empty()
 
-lastJSInputAether = new Aether language: 'python'
+lastJSInputAether = new Aether
 lastAetherInput = ""
 watchForCodeChanges = ->
   aetherInput = editors[1].getValue()
@@ -152,6 +162,8 @@ watchForCodeChanges = ->
   return if not lastJSInputAether.hasChangedSignificantly(code, lastJSInputAether.raw) and aetherInput is lastAetherInput
   clearOutput()
   lastAetherInput = aetherInput
+  lastJSInputAether.staticCall = 'output'
+  lastJSInputAether.className = 'Main'
   lastJSInputAether.transpile code
   eval aetherInput
 watchForCodeChanges = _.debounce(watchForCodeChanges, 1000)
@@ -182,7 +194,81 @@ loadExample = (i) ->
   editors[1].setValue ex.aether
   editors[1].clearSelection()
 
+
 examples = [
+  name: "Java Yielding Conditionally"
+  code: '''
+    public class Main {
+        public static void main(String[] args) {
+            hero.charge();
+            hero.hesitate();
+            hero.hesitate();
+            hero.charge();
+            hero.hesitate();
+            hero.charge();
+        }
+    }
+    '''
+  aether: '''
+    var aetherOptions = {
+      executionLimit: 1000,
+      problems: {
+        jshint_W040: {level: "ignore"},
+        aether_MissingThis: {level: "warning"}
+      },
+      yieldConditionally: true,
+      language: 'java',
+      includeFlow: false,
+      includeMetrics: false
+    };
+    var aether = new Aether(aetherOptions);
+    var thisValue = {
+      charge: function() { this.say("attack!"); return "attack!"; },
+      hesitate: function() { this.say("uhh..."); aether._shouldYield = true; },
+      say: console.log
+    };
+    var code = grabDemoCode();
+    aether.transpile(code);
+    var method = aether.createMethod(thisValue);
+    var generator = method();
+    aether.sandboxGenerator(generator);
+    var executeSomeMore = function executeSomeMore() {
+      var result = generator.next();
+      demoShowOutput(aether);
+      if(!result.done)
+        setTimeout(executeSomeMore, 2000);
+    };
+    executeSomeMore();
+    '''
+,
+  name: "Basic Java"
+  code: '''
+    public class Main {
+        public static void main(String[] args) {
+            hero.moveRight(2);
+        }
+    }
+    '''
+
+  aether: '''
+    var thisValue = {
+        moveRight: function (s) { console.log('moveRight(' + s + ')!');}
+    };
+    var aetherOptions = {
+      executionLimit: 1000,
+      problems: {jshint_W040: {level: "ignore"}},
+      language: 'java',
+      includeFlow: false,
+      includeMetrics: false
+    };
+    var aether = new Aether(aetherOptions);
+    var code = grabDemoCode();
+    aether.transpile(code);
+    var method = aether.createMethod(thisValue);
+    aether.run(method);
+    demoShowOutput(aether);
+    '''
+,
   name: "Basic"
   code: '''
     function fib(n) {
@@ -196,6 +282,7 @@ examples = [
   aether: '''
     var thisValue = {say: console.log};
     var aetherOptions = {
+      executionLimit: 1000,
       problems: {jshint_W040: {level: "ignore"}}
     };
     var aether = new Aether(aetherOptions);
@@ -204,6 +291,171 @@ examples = [
     var method = aether.createMethod(thisValue);
     aether.run(method);
     aether.run(method);
+    aether.run(method);
+    demoShowOutput(aether);
+    '''
+,
+  name: "Basic Python"
+  code: '''
+    self.sayItLoud('Hi')
+    '''
+
+  aether: '''
+    var thisValue = {
+        sayItLoud: function (s) { console.log(s + '!');}
+    };
+    var aetherOptions = {
+      executionLimit: 1000,
+      problems: {jshint_W040: {level: "ignore"}},
+      language: 'python'
+    };
+    var aether = new Aether(aetherOptions);
+    var code = grabDemoCode();
+    aether.transpile(code);
+    var method = aether.createMethod(thisValue);
+    aether.run(method);
+    demoShowOutput(aether);
+    '''
+,
+  name: "While true auto yields"
+  code: '''
+    x = 0
+    while True:
+      x += 1
+      if x >= 4:
+        break
+  '''
+  aether: '''
+    var aetherOptions = {
+      yieldConditionally: true,
+      whileTrueAutoYield: true,
+      language: 'python',
+    };
+    var aether = new Aether(aetherOptions);
+    var thisValue = {
+      killCount: 0,
+      slay: function() {
+        this.killCount += 1;
+        aether._shouldYield = true;
+        },
+      getKillCount: function() { return this.killCount; }
+    };
+    var code = grabDemoCode();
+    aether.transpile(code);
+    var f = aether.createFunction();
+    var gen = f.apply(thisValue);
+    console.log(gen.next().done);
+    console.log(gen.next().done);
+    console.log(gen.next().done);
+    console.log(gen.next().done);
+    '''
+,
+  name: "Simple loop"
+  code: '''
+    x = 0
+    loop:
+      y = 0
+      loop:
+        self.slay()
+        y += 1
+        if y >= 2:
+          break
+      x += 1
+      if x >= 3:
+        break
+  '''
+  aether: '''
+    var aetherOptions = {
+      yieldConditionally: true,
+      simpleLoops: true,
+      language: 'python',
+    };
+    var aether = new Aether(aetherOptions);
+    var thisValue = {
+      killCount: 0,
+      slay: function() {
+        this.killCount += 1;
+        aether._shouldYield = true;
+        },
+      getKillCount: function() { return this.killCount; }
+    };
+    var code = grabDemoCode();
+    aether.transpile(code);
+    var f = aether.createFunction();
+    var gen = f.apply(thisValue);
+    for (var i = 1; i <= 3; i++) {
+      for (var j = 1; j <= 2; j++) {
+        console.log(gen.next().done);
+        console.log(thisValue.killCount);
+      }
+      if (i < 3) console.log(gen.next().done);
+    }
+    console.log("Equals 6?", thisValue.killCount);
+    '''
+,
+  name: "Python yielding from subfunction"
+  code: '''
+    def buildArmy():
+        self.hesitate()
+
+    loop:
+        buildArmy()
+    '''
+  aether: '''
+    var aetherOptions = {
+      executionLimit: 1000,
+      problems: {
+        jshint_W040: {level: "ignore"},
+        aether_MissingThis: {level: "warning"}
+      },
+      functionName: "planStrategy",
+      yieldConditionally: true,
+      simpleLoops: true,
+      language: "python",
+      includeFlow: false,
+      includeMetrics: false
+    };
+    var aether = new Aether(aetherOptions);
+    var thisValue = {
+      charge: function() { this.say("attack!"); return "attack!"; },
+      hesitate: function() { this.say("uhh...!!"); aether._shouldYield = true; },
+      say: console.log
+    };
+    var code = grabDemoCode();
+    aether.transpile(code);
+    var method = aether.createMethod(thisValue);
+    var generator = method();
+    aether.sandboxGenerator(generator);
+    var executeSomeMore = function executeSomeMore() {
+      var result = generator.next();
+      demoShowOutput(aether);
+      if(!result.done)
+        setTimeout(executeSomeMore, 2000);
+    };
+    executeSomeMore();
+    '''
+,
+  name: "Python protected"
+  code: '''
+    a = [1]
+    b = [2]
+    c = a + b
+    print(c.type)
+    print(c)
+    '''
+
+  aether: '''
+    var thisValue = {say: console.log};
+    var aetherOptions = {
+      executionLimit: 1000,
+      problems: {jshint_W040: {level: "ignore"}},
+      language:'python',
+      protectAPI:true
+    };
+    var aether = new Aether(aetherOptions);
+    var code = grabDemoCode();
+    aether.transpile(code);
+    var method = aether.createMethod(thisValue);
     aether.run(method);
     demoShowOutput(aether);
     '''
@@ -254,6 +506,7 @@ examples = [
       explode: function() { this.say("Exploooode!"); }
     };
     var aetherOptions = {
+      executionLimit: 1000,
       problems: {
         jshint_W040: {level: "ignore"},
         aether_MissingThis: {level: "warning"}
@@ -281,12 +534,8 @@ examples = [
     '''
 
   aether: '''
-    var thisValue = {
-      charge: function() { this.say("attack!"); return "attack!"; },
-      hesitate: function() { this.say("uhh..."); this._aetherShouldYield = true; },
-      say: console.log
-    };
     var aetherOptions = {
+      executionLimit: 1000,
       problems: {
         jshint_W040: {level: "ignore"},
         aether_MissingThis: {level: "warning"}
@@ -296,6 +545,11 @@ examples = [
       yieldConditionally: true,
     };
     var aether = new Aether(aetherOptions);
+    var thisValue = {
+      charge: function() { this.say("attack!"); return "attack!"; },
+      hesitate: function() { this.say("uhh..."); aether._shouldYield = true; },
+      say: console.log
+    };
     var code = grabDemoCode();
     aether.transpile(code);
     var method = aether.createMethod(thisValue);
@@ -322,6 +576,7 @@ examples = [
       print: console.log
     };
     var aetherOptions = {
+      executionLimit: 1000,
       problems: {
         jshint_W040: {level: "ignore"}
       },
@@ -353,6 +608,7 @@ examples = [
   aether: '''
     var thisValue = {say: console.log};
     var aetherOptions = {
+      executionLimit: 1000,
       problems: {jshint_W040: {level: "ignore"}}
     };
     var aether = new Aether(aetherOptions);
@@ -459,6 +715,7 @@ examples = [
       wait: function() { }
     };
     var aetherOptions = {
+      executionLimit: 10000,
       problems: {
         jshint_W040: {level: "ignore"},
         aether_MissingThis: {level: "warning"}
@@ -484,5 +741,53 @@ examples = [
     else {
       demoShowOutput(aether);
     }
+    '''
+,
+  name: "User method"
+  code: '''
+    function f(self) {
+        self.hesitate();
+        b(self);
+        (function () {
+            self.stroll();
+        })();
+    }
+    function b(self) {
+        self.hesitate();
+    }
+    f(this);
+    this.charge();
+    '''
+
+  aether: '''
+    var aetherOptions = {
+      executionLimit: 1000,
+      problems: {
+        jshint_W040: {level: "ignore"},
+        aether_MissingThis: {level: "warning"}
+      },
+      functionName: "planStrategy",
+      functionParameters: ["retries"],
+      yieldConditionally: true,
+    };
+    var aether = new Aether(aetherOptions);
+    var thisValue = {
+      charge: function() { this.say("attack!"); return "attack!"; },
+      hesitate: function() { this.say("uhh..."); aether._shouldYield = true; },
+      stroll: function() { this.say("strolling..."); aether._shouldYield = true; },
+      say: console.log
+    };
+    var code = grabDemoCode();
+    aether.transpile(code);
+    var method = aether.createMethod(thisValue);
+    var generator = method();
+    aether.sandboxGenerator(generator);
+    var executeSomeMore = function executeSomeMore() {
+      var result = generator.next();
+      demoShowOutput(aether);
+      if(!result.done)
+        setTimeout(executeSomeMore, 2000);
+    };
+    executeSomeMore();
     '''
 ]

@@ -1,88 +1,98 @@
+_ = window?._ ? self?._ ? global?._ ? require 'lodash'  # rely on lodash existing, since it busts CodeCombat to browserify it--TODO
+
 problems = require './problems'
 
-getOwnPropertyNames = Object.getOwnPropertyNames
-
-copy = (source, target) ->
-  for name in getOwnPropertyNames source
-    target[name] = source[name]
-
-  return target
-
-cloneBuiltin = (obj,name) ->
-  if not obj?
-    throw name
-
-  masked = {}
-  copy obj, masked
-
-  if obj::
-    masked:: = {}
-    copy obj::, masked::
-
-  return masked
-
-
-module.exports.copyBuiltin = copyBuiltin = (source, target) ->
-  copy source, target
-
-  if source::
-    copy source::, target::
-
-
+# These builtins, being objects, will have to be cloned and restored.
 module.exports.builtinObjectNames = builtinObjectNames = [
-  # Built-in objects
+  # Built-in Objects
   'Object', 'Function', 'Array', 'String', 'Boolean', 'Number', 'Date', 'RegExp', 'Math', 'JSON',
 
   # Error Objects
   'Error', 'EvalError', 'RangeError', 'ReferenceError', 'SyntaxError', 'TypeError', 'URIError'
 ]
 
+# These builtins aren't objects, so it's easy.
 module.exports.builtinNames = builtinNames = builtinObjectNames.concat [
-  # Math related
+  # Math-related
   'NaN', 'Infinity', 'undefined', 'parseInt', 'parseFloat', 'isNaN', 'isFinite',
 
-  # URI related
+  # URI-related
   'decodeURI', 'decodeURIComponent', 'encodeURI', 'encodeURIComponent',
 
-  # Nope
+  # Nope!
   # 'eval'
 ]
 
-global = (-> @)()
-builtinClones = []
-builtinReal = []
-addedGlobals = {}
+Object.freeze Error  # https://github.com/codecombat/aether/issues/81
+
+getOwnPropertyNames = Object.getOwnPropertyNames  # Grab all properties, including non-enumerable ones.
+getOwnPropertyDescriptor = Object.getOwnPropertyDescriptor
+defineProperty = Object.defineProperty.bind Object
+copy = (source, target) ->
+  return target if not target?
+  for name in getOwnPropertyNames source when name isnt 'caller' and name isnt 'arguments'
+    if getOwnPropertyDescriptor
+      desc = getOwnPropertyDescriptor source, name
+      if not desc.get
+        target[name] = desc.value
+    else
+      target[name] = source[name]
+  target
+
+cloneBuiltin = (obj) ->
+  masked = {}
+  copy obj, masked
+  if obj::
+    masked:: = {}
+    copy obj::, masked::
+  masked
+
+copyBuiltin = (source, target, resetPrototype) ->
+  copy source, target
+  if source::
+    copy source::, target::
+    if resetPrototype
+      # I wish I could just do target:: = {} above, but it doesn't work.
+      delete target::[name] for name in getOwnPropertyNames(target::) when not source::[name]?
+
+globalScope = (-> @)()
+builtinClones = []  # We make pristine copies of our builtins so that we can copy them overtop the real ones later.
+builtinReal = []  # These are the globals that the player will actually get to mess with, which we'll clean up after.
+module.exports.addedGlobals = addedGlobals = {}
 
 module.exports.addGlobal = addGlobal = (name, value) ->
-  # Ex.: Aether.addGlobal('Vector', require('lib/world/vector')), before the Aether instance is constructed
+  # Ex.: Aether.addGlobal('Vector', require('lib/world/vector')), before the Aether instance is constructed.
   return if addedGlobals[name]?
-  value ?= global[name]
-  builtinClones.push cloneBuiltin(value, name)
+  value ?= globalScope[name]
+  builtinClones.push cloneBuiltin value
   builtinReal.push value
   addedGlobals[name] = value
 
-addGlobal name for name in builtinObjectNames
+addGlobal name for name in builtinObjectNames  # Protect our initial builtin objects as globals.
 
-module.exports.restoreBuiltins = restoreBuiltins = (globals)->
-  ## Mask Builtins
+module.exports.replaceBuiltin = replaceBuiltin = (name, value) ->
+  # Say we want to protect a new version of Math (for Math.random) afterwards. We'll use this.
+  builtinIndex = _.indexOf builtinReal, value
+  return console.error "We can't replace builtin #{name}, because we never added it:", value if builtinIndex is -1
+  builtinClones[builtinIndex] = cloneBuiltin value
+
+module.exports.restoreBuiltins = restoreBuiltins = ->
+  # Restore the original state of the builtins.
   for name, offset in builtinObjectNames
     real = builtinReal[offset]
     cloned = builtinClones[offset]
-    copyBuiltin cloned, real
-    global[name] = real
+    copyBuiltin cloned, real, true  # Write over the real object with the pristine clone.
+    globalScope[name] = real
   return
 
 
-module.exports.raiseDisabledFunctionConstructor = raiseDisabledFunctionConstructor = ->
-  # Should we make this a normal Aether UserCodeProblem?
+raiseDisabledFunctionConstructor = ->
   throw new Error '[Sandbox] Function::constructor is disabled. If you are a developer, please make sure you have a reference to your builtins.'
-
 
 module.exports.createSandboxedFunction = createSandboxedFunction = (functionName, code, aether) ->
   dummyContext = {}
-  globalRef = global ? window
   for name in builtinNames.concat aether.options.globals, Object.keys aether.language.runtimeGlobals
-    dummyContext[name] = addedGlobals[name] ? globalRef[name]
+    dummyContext[name] = addedGlobals[name] ? globalScope[name]
   dummyFunction = raiseDisabledFunctionConstructor
   copyBuiltin Function, dummyFunction
   dummyContext.Function = dummyFunction
@@ -92,7 +102,7 @@ module.exports.createSandboxedFunction = createSandboxedFunction = (functionName
     wrapper = new Function ['_aether'], code
     wrapper.call dummyContext, aether
   catch e
-    console.warn "Error creating function, so returning empty function instead. Error: #{e}\nCode:", code
+    console.warn "Error creating function. Returning empty function instead. Error: #{e}"  #\nCode:", code
     problem = aether.createUserCodeProblem reporter: 'aether', type: 'transpile', kind: 'Untranspilable', message: 'Code could not be compiled. Check syntax.', error: e, code: code, codePrefix: ''
     aether.addProblem problem
     return ->
@@ -100,8 +110,7 @@ module.exports.createSandboxedFunction = createSandboxedFunction = (functionName
   dummyContext[functionName]
 
 module.exports.wrapWithSandbox = wrapWithSandbox = (self, fn) ->
-  # Wrap calls to aether function in a sandbox
-  # This is NOT safe with functions parsed outside of aether
+  # Wrap calls to Aether function in a sandbox. Not safe with functions parsed outside of Aether.
   ->
     Function::constructor = raiseDisabledFunctionConstructor
     try

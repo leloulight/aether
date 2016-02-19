@@ -1,4 +1,40 @@
 ranges = require './ranges'
+string_score = require 'string_score'
+
+# Problems #################################
+#
+# Error messages and hints:
+#   Processed by markdown
+#   In general, put correct replacement code in a markdown code span.  E.g. "Try `self.moveRight()`"
+#
+#
+# Problem Context (problemContext)
+#
+# Aether accepts a problemContext parameter via the constructor options or directly to createUserCodeProblem
+# This context can be used to craft better errors messages.
+#
+# Example:
+#   Incorrect user code is 'this.attack(Brak);'
+#   Correct user code is 'this.attack("Brak");'
+#   Error: 'Brak is undefined'
+#   If we had a list of expected string references, we could provide a better error message:
+#   'Brak is undefined. Are you missing quotes? Try this.attack("Brak");'
+#
+# Available Context Properties:
+#   stringReferences: values that should be referred to as a string instead of a variable (e.g. "Brak", not Brak)
+#   thisMethods: methods available on the 'this' object
+#   thisProperties: properties available on the 'this' object
+#   commonThisMethods: methods that are available sometimes, but not awlays
+#
+
+# Esprima Harmony's error messages track V8's
+# https://github.com/ariya/esprima/blob/harmony/esprima.js#L194
+
+# JSHint's error and warning messages
+# https://github.com/jshint/jshint/blob/master/src/messages.js
+
+scoreFuzziness = 0.8
+acceptMatchThreshold = 0.5
 
 module.exports.createUserCodeProblem = (options) ->
   options ?= {}
@@ -24,9 +60,11 @@ module.exports.createUserCodeProblem = (options) ->
   p
 
 
+# Transpile Errors
+
 extractTranspileErrorDetails = (options) ->
   code = options.code or ''
-  codePrefix = options.codePrefix or 'function wrapped() {\n"use strict";\n'
+  codePrefix = options.codePrefix or ''
   error = options.error
   options.message = error.message
 
@@ -38,6 +76,12 @@ extractTranspileErrorDetails = (options) ->
     when 'jshint'
       options.message ?= error.reason
       options.kind ?= error.code
+
+      # TODO: Put this transpile error hint creation somewhere reasonable
+      if doubleVar = options.message.match /'([\w]+)' is already defined\./
+        # TODO: Check that it's a var and not a function
+        options.hint = "Don't use the 'var' keyword for '#{doubleVar[1]}' the second time."
+
       unless options.level
         options.level = {E: 'error', W: 'warning', I: 'info'}[error.code[0]]
       line = error.line - codePrefix.split('\n').length
@@ -68,24 +112,119 @@ extractTranspileErrorDetails = (options) ->
     when 'aether'
       null
     when 'closer'
-      null
+      if error.startOffset and error.endOffset
+        range = ranges.offsetsToRange(error.startOffset, error.endOffset, code)
+        options.range = [range.start, range.end]
     when 'lua2js'
-      null
+      options.message ?= error.message
+      rng = ranges.offsetsToRange(error.offset, error.offset, code, '')
+      options.range = [rng.start, rng.end]
     when 'filbert'
-      null
+      if error.loc
+        columnOffset = 0
+        columnOffset++ while originalLines[lineOffset - 2][columnOffset] is ' '
+        # filbert lines are 1-based, columns are 0-based
+        row = error.loc.line - lineOffset - 1
+        col = error.loc.column - columnOffset
+        start = ranges.rowColToPos(row, col, code, codePrefix)
+        end = ranges.rowColToPos(row, col + error.raisedAt - error.pos, code, codePrefix)
+        # Remove per-row indents
+        start.ofs -= row * 4
+        end.ofs -= row * 4
+        options.range = [start, end]
+
+        errorContext = options.problemContext or options.aether?.options?.problemContext
+        languageID = options.aether?.options?.language
+        options.hint = error.hint or getTranspileHint options.message, errorContext, languageID, options.aether.raw, options.range, options.aether.options?.simpleLoops
     when 'iota'
+      null
+    when 'cashew'
+      # TODO: anything here?
       null
     else
       console.warn "Unhandled UserCodeProblem reporter", options.reporter
 
   options
 
+getTranspileHint = (msg, context, languageID, code, range, simpleLoops=false) ->
+  # TODO: Only used by Python currently
+  # TODO: JavaScript blocked by jshint range bug: https://github.com/codecombat/aether/issues/113
+  if msg is "Unterminated string constant" and range?
+    codeSnippet = code.substring range[0].ofs, range[1].ofs
+    # Trim codeSnippet so we can construct the correct suggestion with an ending quote
+    if codeSnippet.length > 0 and codeSnippet[0] in ["'", '"']
+      quoteCharacter = codeSnippet[0]
+      codeSnippet = codeSnippet.slice(1)
+      codeSnippet = codeSnippet.substring 0, nonAlphNumMatch.index if nonAlphNumMatch = codeSnippet.match /[^\w]/
+      return "Missing a quotation mark. Try `#{quoteCharacter}#{codeSnippet}#{quoteCharacter}`"
+
+  else if msg is "Unexpected indent"
+    if range?
+      index = range[0].ofs
+      index-- while index > 0 and /\s/.test(code[index])
+      if index >= 3 and /else/.test(code.substring(index - 3, index + 1))
+        return "You are missing a ':' after 'else'. Try `else:`"
+    return "Code needs to line up."
+    
+  else if msg.indexOf("Unexpected token") >= 0 and context?
+    codeSnippet = code.substring range[0].ofs, range[1].ofs
+    lineStart = code.substring range[0].ofs - range[0].col, range[0].ofs
+    lineStartLow = lineStart.toLowerCase()
+    # console.log "Aether transpile problem codeSnippet='#{codeSnippet}' lineStart='#{lineStart}'"
+
+    # Check for extra thisValue + space at beginning of line
+    # E.g. 'self self.moveRight()'
+    hintCreator = new HintCreator context, languageID
+    if lineStart.indexOf(hintCreator.thisValue) is 0 and lineStart.trim().length < lineStart.length
+      # TODO: update error range so this extra bit is highlighted
+      if codeSnippet.indexOf(hintCreator.thisValue) is 0
+        return "Delete extra `#{hintCreator.thisValue}`"
+      else
+        return hintCreator.getReferenceErrorHint codeSnippet
+
+    # Check for two commands on a single line with no semi-colon
+    # E.g. "self.moveRight()self.moveDown()"
+    # Check for problems following a ')'
+    prevIndex = range[0].ofs - 1
+    prevIndex-- while prevIndex >= 0 and /[\t ]/.test(code[prevIndex])
+    if prevIndex >= 0 and code[prevIndex] is ')'
+      if codeSnippet is ')'
+        return "Delete extra `)`"
+      else if not /^\s*$/.test(codeSnippet)
+        return "Put each command on a separate line"
+
+    parens = 0
+    parens += (if c is '(' then 1 else if c is ')' then -1 else 0) for c in lineStart
+    return "Your parentheses must match." unless parens is 0
+
+    # Check for uppercase loop
+    # TODO: Should get 'loop' from problem context
+    if simpleLoops and codeSnippet is ':' and lineStart isnt lineStartLow and lineStartLow is 'loop'
+      return "Should be lowercase. Try `loop`"
+
+    # Check for malformed if statements
+    if /^\s*if /.test(lineStart)
+      if codeSnippet is ':'
+        return "Your if statement is missing a test clause. Try `if True:`"
+      else if /^\s*$/.test(codeSnippet)
+        # TODO: Upate error range to be around lineStart in this case
+        return "You are missing a ':' after '#{lineStart}'. Try `#{lineStart}:`"
+
+    # Catchall hint for 'Unexpected token' error
+    if /Unexpected token/.test(msg)
+      return "Please double-check your code carefully."
+
+# Runtime Errors
 
 extractRuntimeErrorDetails = (options) ->
+  # NOTE: lastStatementRange set via instrumentation.logStatementStart(originalNode.originalRange)
+  options.range ?= options.aether?.lastStatementRange
   if error = options.error
     options.kind ?= error.name  # I think this will pick up [Error, EvalError, RangeError, ReferenceError, SyntaxError, TypeError, URIError, DOMException]
-    options.message = explainErrorMessage error.message or error.toString()
-  options.range ?= options.aether?.lastStatementRange
+    options.message = error.message or error.toString()
+    options.hint = error.hint or getRuntimeHint options
+    options.level ?= error.level
+    options.userInfo ?= error.userInfo
   if options.range
     lineNumber = options.range[0].row + 1
     if options.message.search(/^Line \d+/) != -1
@@ -93,41 +232,162 @@ extractRuntimeErrorDetails = (options) ->
     else
       options.message = "Line #{lineNumber}: #{options.message}"
 
-module.exports.commonMethods = commonMethods = ['moveRight', 'moveLeft', 'moveUp', 'moveDown', 'attackNearbyEnemy', 'say', 'move', 'attackNearestEnemy', 'shootAt', 'rotateTo', 'shoot', 'distance', 'getNearestEnemy', 'getEnemies', 'attack', 'setAction', 'setTarget', 'getFriends', 'patrol']  # TODO: should be part of user configuration
+getRuntimeHint = (options) ->
+  code = options.aether.raw or ''
+  context = options.problemContext or options.aether.options?.problemContext
+  languageID = options.aether.options?.language
+  simpleLoops = options.aether.options?.simpleLoops
 
-explainErrorMessage = (m) ->
-  if m is "RangeError: Maximum call stack size exceeded"
-    m += ". (Did you use call a function recursively?)"
+  # Check stack overflow
+  return "Did you call a function recursively?" if options.message is "RangeError: Maximum call stack size exceeded"
 
-  missingMethodMatch = m.match /has no method '(.*?)'/
-  if missingMethodMatch
-    method = missingMethodMatch[1]
-    [closestMatch, closestMatchScore] = ['Murgatroyd Kerfluffle', 0]
-    explained = false
-    for commonMethod in commonMethods
-      if method is commonMethod
-        m += ". (#{missingMethodMatch[1]} not available in this challenge.)"
-        explained = true
-        break
-      else if method.toLowerCase() is commonMethod.toLowerCase()
-        m = "#{method} should be #{commonMethod} because JavaScript is case-sensitive."
-        explained = true
-        break
-      else
-        matchScore = string_score?.score commonMethod, method, 0.5
-        if matchScore > closestMatchScore
-          [closestMatch, closestMatchScore] = [commonMethod, matchScore]
-    unless explained
-      if closestMatchScore > 0.25
-        m += ". (Did you mean #{closestMatch}?)"
+  # Check loop ReferenceError
+  if simpleLoops and languageID is 'python' and /ReferenceError: loop is not defined/.test options.message
+    # TODO: move this language-specific stuff to language-specific code
+    if options.range?
+      index = options.range[1].ofs
+      index++ while index < code.length and /[^\n:]/.test code[index]
+      hint = "You are missing a ':' after 'loop'. Try `loop:`" if index >= code.length or code[index] is '\n'
+    else
+      hint = "Are you missing a ':' after 'loop'? Try `loop:`"
+    return hint
 
-    m = m.replace 'TypeError:', 'Error:'
+  # Use problemContext to add hints
+  return unless context?
+  hintCreator = new HintCreator context, languageID
+  hintCreator.getHint options.message, code, options.range
 
-  m
+class HintCreator
+  # Create hints for an error message based on a problem context
+  # TODO: better class name, move this to a separate file
 
+  constructor: (context, languageID) ->
+    # TODO: move this language-specific stuff to language-specific code
+    @thisValue = switch languageID
+      when 'python' then 'self'
+      when 'cofeescript' then '@'
+      else 'this'
+    @thisValueAccess = switch languageID
+      when 'python' then 'self.'
+      when 'cofeescript' then '@'
+      else 'this.'
+    @methodRegex = switch languageID
+      when 'python' then new RegExp "self\\.(\\w+)\\s*\\("
+      when 'cofeescript' then new RegExp "@(\\w+)\\s*\\("
+      else new RegExp "this\\.(\\w+)\\("
+    @context = context ? {}
 
-# Esprima Harmony's error messages track V8's
-# https://github.com/ariya/esprima/blob/harmony/esprima.js#L194
+  getHint: (msg, code, range) ->
+    return unless @context?
+    if (missingMethodMatch = msg.match(/has no method '(.*?)'/)) or msg.match(/is not a function/) or msg.match(/has no method/)
+      # NOTE: We only get this for valid thisValue and parens: self.blahblah()
+      # NOTE: We get different error messages for this based on javascript engine:
+      # Chrome: 'undefined is not a function'
+      # Firefox: 'tmp5[tmp6] is not a function'
+      # test framework: 'Line 1: Object #<Object> has no method 'moveright'
+      if missingMethodMatch
+        target = missingMethodMatch[1]
+      else if range?
+        # TODO: this is not covered by any test cases yet, because our test environment throws different errors
+        codeSnippet = code.substring range[0].ofs, range[1].ofs
+        missingMethodMatch = @methodRegex.exec codeSnippet
+        target = missingMethodMatch[1] if missingMethodMatch?
+      hint = if target? then @getNoFunctionHint target
+    else if missingReference = msg.match /ReferenceError: ([^\s]+) is not defined/
+      hint = @getReferenceErrorHint missingReference[1]
+    else if missingProperty = msg.match /Cannot (?:read|call) (?:property|method) '([\w]+)' of (?:undefined|null)/
+      # Chrome: "Cannot read property 'moveUp' of undefined"
+      # TODO: Firefox: "tmp5 is undefined"
+      hint = @getReferenceErrorHint missingProperty[1]
 
-# JSHint's error and warning messages
-# https://github.com/jshint/jshint/blob/master/src/messages.js
+      # Chrome: "Cannot read property 'pos' of null"
+      # TODO: Firefox: "tmp10 is null"
+      # TODO: range is pretty busted, but row seems ok so we'll use that.
+      # TODO: Should we use a different message if object was 'undefined' instead of 'null'?
+      if not hint? and range?
+        line = code.substring range[0].ofs - range[0].col, code.indexOf('\n', range[1].ofs)
+        nullObjRegex = new RegExp "(\\w+)\\.#{missingProperty[1]}"
+        if nullObjMatch = nullObjRegex.exec line
+          hint = "'#{nullObjMatch[1]}' was null. Use a null check before accessing properties. Try `if #{nullObjMatch[1]}:`"
+    hint
+
+  getNoFunctionHint: (target) ->
+    # Check thisMethods
+    hint = @getNoCaseMatch target, @context.thisMethods, (match) =>
+      # TODO: Remove these format tests someday.
+      # "Uppercase or lowercase problem. Try #{@thisValueAccess}#{match}()"
+      # "Uppercase or lowercase problem.  \n  \n\tTry: #{@thisValueAccess}#{match}()  \n\tHad: #{codeSnippet}"
+      # "Uppercase or lowercase problem.  \n  \nTry:  \n`#{@thisValueAccess}#{match}()`  \n  \nInstead of:  \n`#{codeSnippet}`"
+      "Uppercase or lowercase problem. Try `#{@thisValueAccess}#{match}()`"
+    hint ?= @getScoreMatch target, [candidates: @context.thisMethods, msgFormatFn: (match) =>
+      "Try `#{@thisValueAccess}#{match}()`"]
+    # Check commonThisMethods
+    hint ?= @getExactMatch target, @context.commonThisMethods, (match) ->
+      "You do not have an item equipped with the #{match} skill."
+    hint ?= @getNoCaseMatch target, @context.commonThisMethods, (match) ->
+      "Did you mean #{match}? You do not have an item equipped with that skill."
+    hint ?= @getScoreMatch target, [candidates: @context.commonThisMethods, msgFormatFn: (match) ->
+      "Did you mean #{match}? You do not have an item equipped with that skill."]
+    hint ?= "You don't have a `#{target}` method."
+    hint
+
+  getReferenceErrorHint: (target) ->
+    # Check missing quotes
+    hint = @getExactMatch target, @context.stringReferences, (match) ->
+      "Missing quotes. Try `\"#{match}\"`"
+    # Check this props
+    hint ?= @getExactMatch target, @context.thisMethods, (match) =>
+      "Try `#{@thisValueAccess}#{match}()`"
+    hint ?= @getExactMatch target, @context.thisProperties, (match) =>
+      "Try `#{@thisValueAccess}#{match}`"
+    # Check case-insensitive, quotes, this props
+    if not hint? and target.toLowerCase() is @thisValue.toLowerCase()
+      hint = "Uppercase or lowercase problem. Try `#{@thisValue}`"
+    hint ?= @getNoCaseMatch target, @context.stringReferences, (match) ->
+      "Missing quotes.  Try `\"#{match}\"`"
+    hint ?= @getNoCaseMatch target, @context.thisMethods, (match) =>
+      "Try `#{@thisValueAccess}#{match}()`"
+    hint ?= @getNoCaseMatch target, @context.thisProperties, (match) =>
+      "Try `#{@thisValueAccess}#{match}`"
+    # Check score match, quotes, this props
+    hint ?= @getScoreMatch target, [
+      {candidates: [@thisValue], msgFormatFn: (match) -> "Try `#{match}`"},
+      {candidates: @context.stringReferences, msgFormatFn: (match) -> "Missing quotes. Try `\"#{match}\"`"},
+      {candidates: @context.thisMethods, msgFormatFn: (match) => "Try `#{@thisValueAccess}#{match}()`"},
+      {candidates: @context.thisProperties, msgFormatFn: (match) => "Try `#{@thisValueAccess}#{match}`"}]
+    # Check commonThisMethods
+    hint ?= @getExactMatch target, @context.commonThisMethods, (match) ->
+      "You do not have an item equipped with the #{match} skill."
+    hint ?= @getNoCaseMatch target, @context.commonThisMethods, (match) ->
+      "Did you mean #{match}? You do not have an item equipped with that skill."
+    hint ?= @getScoreMatch target, [candidates: @context.commonThisMethods, msgFormatFn: (match) ->
+      "Did you mean #{match}? You do not have an item equipped with that skill."]
+
+    # Try score match with this value prefixed
+    # E.g. target = 'selfmoveright', try 'self.moveRight()''
+    if not hint? and @context?.thisMethods?
+      thisPrefixed = (@thisValueAccess + method for method in @context.thisMethods)
+      hint = @getScoreMatch target, [candidates: thisPrefixed, msgFormatFn: (match) ->
+        "Try `#{match}()`"]
+    hint
+
+  getExactMatch: (target, candidates, msgFormatFn) ->
+    return unless candidates?
+    msgFormatFn target if target in candidates
+
+  getNoCaseMatch: (target, candidates, msgFormatFn) ->
+    return unless candidates?
+    candidatesLow = (s.toLowerCase() for s in candidates)
+    msgFormatFn candidates[index] if (index = candidatesLow.indexOf target.toLowerCase()) >= 0
+
+  getScoreMatch: (target, candidatesList) ->
+    # candidatesList is an array of candidates objects. E.g. [{candidates: [], msgFormatFn: ()->}, ...]
+    # This allows a score match across multiple lists of candidates (e.g. thisMethods and thisProperties)
+    return unless string_score?
+    [closestMatch, closestScore, msg] = ['', 0, '']
+    for set in candidatesList
+      if set.candidates?
+        for match in set.candidates
+          matchScore = match.score target, scoreFuzziness
+          [closestMatch, closestScore, msg] = [match, matchScore, set.msgFormatFn(match)] if matchScore > closestScore
+    msg if closestScore >= acceptMatchThreshold
